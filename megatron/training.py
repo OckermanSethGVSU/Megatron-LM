@@ -263,7 +263,7 @@ def pretrain(train_valid_test_dataset_provider,
 
         print_datetime('after training is done')
 
-        if args.save and iteration != 0 and iteration % args.save_interval != 0:
+        if args.save and iteration != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                             num_floating_point_operations_so_far)
     else:
@@ -519,7 +519,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -968,13 +968,54 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler,
-                       config)
+        aStart = torch.cuda.Event(enable_timing=True)
+        aEnd = torch.cuda.Event(enable_timing=True)
+        # torch.cuda.cudart().cudaProfilerStart()
+
+        runtime = 0.0
+        times = []
+
+        for iter in range(20):
+            for i in range(4):
+                if i == 3: 
+                    aStart.record()
+                    # torch.cuda.nvtx.range_push("Train Step Start") 
+                    # torch.cuda.cudart().cudaProfilerStart()
+                    # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config)
+                
+                
+                if i == 3:
+                    aEnd.record()
+                    torch.cuda.nvtx.range_pop()
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+            rank = torch.distributed.get_rank()
+            if rank == 0:
+                runtime = aStart.elapsed_time(aEnd)
+                times.append(runtime)
+                with open('times.txt', 'a') as file:
+                    file.write(str(runtime) + '\n')
+        if rank == 0:
+            avg = sum(times) / len(times)
+            with open('average.txt', 'a') as file:
+                        file.write(str(avg) + '\n')
+
+
+
+        # loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        #     train_step(forward_step_func,
+        #                train_data_iterator,
+        #                model,
+        #                optimizer,
+        #                opt_param_scheduler,
+        #                config)
         iteration += 1
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
@@ -1145,7 +1186,9 @@ def evaluate(forward_step_func,
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
-            config.timers = None
+            # print(f"evaluate config type: {type(config)}; config: {config}")
+            
+            # config.timers = None
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -1155,7 +1198,8 @@ def evaluate(forward_step_func,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True)
-            config.timers = get_timers()
+            
+            # config.timers = get_timers()
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -1219,7 +1263,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
         writer = None
 
     wandb_writer = get_wandb_writer()
-
+    # print(f"evaluate_and_print_results config: {config}")
     total_loss_dict, collected_non_loss_data, timelimit = evaluate(
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
